@@ -1,0 +1,179 @@
+import cv2
+import numpy as np
+import os
+import pandas as pd
+from sklearn.cluster import KMeans
+from sklearn.metrics import confusion_matrix, classification_report, cohen_kappa_score
+from collections import Counter
+
+# --- Display option (does NOT affect analysis) ---
+DISPLAY_AT_ORIGINAL_SIZE = False
+
+def process_image(image):
+    smaller_img = cv2.resize(image, (0, 0), fx=0.3, fy=0.3)
+    hsv = cv2.cvtColor(smaller_img, cv2.COLOR_BGR2HSV)
+
+    lower_green = np.array([40, 40, 40])
+    upper_green = np.array([80, 255, 255])
+    green_mask = cv2.inRange(hsv, lower_green, upper_green)
+
+    binary = np.where(green_mask == 255, 0, 1).astype(np.uint8)
+
+    kernel = np.ones((7, 7), np.uint8)
+    cleaned = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+
+    contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    hu_moments_list = []
+    perimeters = []
+    areas = []
+    valid_contours = []
+
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area > 1000:
+            moments = cv2.moments(contour)
+            hu_moments = cv2.HuMoments(moments).flatten()
+            hu_log = -np.sign(hu_moments) * np.log10(np.abs(hu_moments) + 1e-10)
+
+            hu_moments_list.append(hu_log)
+            perimeters.append(cv2.arcLength(contour, True))
+            areas.append(area)
+            valid_contours.append(contour)
+
+    return hu_moments_list, perimeters, areas, valid_contours, smaller_img.shape[:2]
+
+# --- Settings ---
+folder_path = r'C:\Users\Nicolai\Desktop\animals'
+labels_path = os.path.join(folder_path, 'animals.txt')
+
+image_files = sorted([f for f in os.listdir(folder_path) if f.lower().endswith(('.jpg', '.png', '.jpeg'))])
+
+# --- Read labels ---
+labels_df = pd.read_csv(labels_path, sep='\t')
+labels_df = labels_df[~labels_df['label'].isin(['unknown', 'kion'])]
+labels_df = labels_df[labels_df['animal_index'].apply(lambda x: str(x).isdigit())]
+labels_df['animal_index'] = labels_df['animal_index'].astype(int)
+
+# --- Data containers ---
+all_hu = []
+all_perimeters = []
+all_areas = []
+all_contours = []
+img_contour_map = []
+processed_shapes = {}
+original_shapes = {}
+
+# Process all images
+loaded_images = []
+for i, filename in enumerate(image_files):
+    img_path = os.path.join(folder_path, filename)
+    img = cv2.imread(img_path)
+    if img is None:
+        print(f"Failed to load {filename}, skipping.")
+        loaded_images.append(None)
+        continue
+
+    loaded_images.append(img)
+    original_shapes[i] = img.shape[:2]
+
+    hu_list, perimeters, areas, contours, proc_shape = process_image(img)
+    processed_shapes[i] = proc_shape
+
+    for _ in contours:
+        img_contour_map.append(i)
+
+    all_hu.extend(hu_list)
+    all_perimeters.extend(perimeters)
+    all_areas.extend(areas)
+    all_contours.extend(contours)
+
+total_animals = len(all_hu)
+print(f"Total animals detected: {total_animals}")
+if total_animals == 0:
+    print("No animals detected. Exiting.")
+    raise SystemExit
+
+# --- KMeans clustering ---
+X = np.array(all_hu)
+n_clusters = 5
+kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+cluster_labels = kmeans.fit_predict(X)
+
+# --- Map true labels ---
+true_labels = ['unknown'] * total_animals
+for _, row in labels_df.iterrows():
+    idx = row['animal_index'] - 1
+    if 0 <= idx < total_animals:
+        true_labels[idx] = row['label']
+
+valid_indices = [i for i, label in enumerate(true_labels) if label != 'unknown']
+filtered_true_labels = np.array([true_labels[i] for i in valid_indices])
+filtered_pred_labels = np.array([cluster_labels[i] for i in valid_indices])
+
+print(f"Total labels in labels_df: {len(labels_df)}")
+print(f"Number of known labels assigned: {sum(label != 'unknown' for label in true_labels)}")
+
+# --- Map clusters to species ---
+cluster_to_label = {}
+if filtered_pred_labels.size > 0:
+    for cluster_id in np.unique(filtered_pred_labels):
+        indices = np.where(filtered_pred_labels == cluster_id)[0]
+        true_labels_in_cluster = filtered_true_labels[indices]
+        most_common_label = Counter(true_labels_in_cluster).most_common(1)[0][0]
+        cluster_to_label[cluster_id] = most_common_label
+
+mapped_pred_labels = [cluster_to_label[c] for c in filtered_pred_labels] if len(cluster_to_label) > 0 else []
+
+# --- Metrics ---
+if len(mapped_pred_labels) > 0:
+    print("\nConfusion Matrix:")
+    cm = confusion_matrix(filtered_true_labels, mapped_pred_labels)
+    print(cm)
+
+    overall_accuracy = np.trace(cm) / np.sum(cm) if np.sum(cm) > 0 else float('nan')
+    print(f"\nOverall Accuracy: {overall_accuracy:.4f}")
+
+    kappa = cohen_kappa_score(filtered_true_labels, mapped_pred_labels)
+    print(f"Cohen's Kappa: {kappa:.4f}")
+
+    print("\nClassification Report:")
+    print(classification_report(filtered_true_labels, mapped_pred_labels, zero_division=0))
+else:
+    print("\nNo valid labeled predictions to evaluate (after filtering 'unknown').")
+
+# --- Visualization ---
+for img_index, filename in enumerate(image_files):
+    if img_index not in processed_shapes:
+        continue
+
+    proc_h, proc_w = processed_shapes[img_index]
+    vis_img = np.zeros((proc_h, proc_w, 3), dtype=np.uint8)
+
+    animal_counter = 0
+    for i, contour in enumerate(all_contours):
+        if img_contour_map[i] == img_index:
+            animal_counter += 1
+            cv2.drawContours(vis_img, [contour], -1, (255, 255, 255), thickness=cv2.FILLED)
+
+            moments = cv2.moments(contour)
+            if moments["m00"] != 0:
+                cX = int(moments["m10"] / moments["m00"])
+                cY = int(moments["m01"] / moments["m00"])
+            else:
+                cX, cY = 0, 0
+
+            cv2.putText(vis_img, f'{animal_counter}', (cX, cY),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+
+    if DISPLAY_AT_ORIGINAL_SIZE and img_index in original_shapes:
+        orig_h, orig_w = original_shapes[img_index]
+        vis_img_to_show = cv2.resize(vis_img, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+    else:
+        vis_img_to_show = vis_img
+
+    window_title = f'Clustered Animals - {filename}'
+    cv2.imshow(window_title, vis_img_to_show)
+
+cv2.waitKey(0)
+cv2.destroyAllWindows()
